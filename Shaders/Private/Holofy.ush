@@ -1,0 +1,321 @@
+// Holofy - stylized hologram / transmission / screen shading.
+//
+// Included by the Custom nodes inside the generated M_Holofy_* master materials.
+// Field names in FHolofyParams MUST match the parameter names emitted by
+// FHolofyStyleSettings::ForEachScalarParameter / ForEachVectorParameter, because the
+// editor generates "P.<Name> = In_<Name>;" for every parameter.
+
+#pragma once
+
+#define HOLOFY_TAU 6.28318530718
+
+struct FHolofyParams
+{
+	// Color
+	float3 HoloColor;
+	float3 RimColor;
+	float Brightness;
+	float Opacity;
+	float RimPower;
+	float RimIntensity;
+	float VertexColorAmount;
+
+	// Scanlines + sweep band
+	float ScanlineDensity;
+	float ScanlineSpeed;
+	float ScanlineIntensity;
+	float ScanlineSharpness;
+	float BandIntensity;
+	float BandSpeed;
+	float BandWidth;
+
+	// Signal quality
+	float SignalStrength;
+	float FlickerIntensity;
+	float FlickerSpeed;
+	float NoiseIntensity;
+	float NoiseScale;
+
+	// Glitch
+	float GlitchIntensity;
+	float GlitchFrequency;
+	float GlitchSlices;
+	float ChromaticAberration;
+	float GlitchVertexOffset;
+
+	// Grid
+	float GridIntensity;
+	float GridDensity;
+	float GridThickness;
+
+	// Screen (CRT-ish)
+	float Curvature;
+	float Vignette;
+	float PixelGridIntensity;
+	float PixelGridDensity;
+
+	// Content texture
+	float ContentIntensity;
+	float ContentTintAmount;
+	float ContentPixelate;
+
+	// Materialize
+	float Materialize;
+	float MaterializeEdgeWidth;
+	float MaterializeEdgeBrightness;
+
+	// Space
+	float CoordinateSpace; // 0 = Local (meters), 1 = UV, 2 = Screen
+	float UVRotation;      // quarter turns
+	float FlipU;
+};
+
+struct FHolofyContext
+{
+	float2 UV;
+	float2 ScreenUV;
+	float3 LocalPos;
+	float3 Normal;
+	float3 CameraVector;
+	float Time;
+	float4 VertexColor;
+};
+
+// ---------------------------------------------------------------------------
+// Noise helpers
+// ---------------------------------------------------------------------------
+
+float HolofyHash11(float p)
+{
+	p = frac(p * 0.1031);
+	p *= p + 33.33;
+	p *= p + p;
+	return frac(p);
+}
+
+float HolofyHash21(float2 p)
+{
+	float3 p3 = frac(float3(p.xyx) * 0.1031);
+	p3 += dot(p3, p3.yzx + 33.33);
+	return frac((p3.x + p3.y) * p3.z);
+}
+
+float HolofyNoise1D(float x)
+{
+	const float i = floor(x);
+	const float f = frac(x);
+	const float u = f * f * (3.0 - 2.0 * f);
+	return lerp(HolofyHash11(i), HolofyHash11(i + 1.0), u);
+}
+
+float HolofyNoise2D(float2 p)
+{
+	const float2 i = floor(p);
+	const float2 f = frac(p);
+	const float2 u = f * f * (3.0 - 2.0 * f);
+	const float a = HolofyHash21(i);
+	const float b = HolofyHash21(i + float2(1.0, 0.0));
+	const float c = HolofyHash21(i + float2(0.0, 1.0));
+	const float d = HolofyHash21(i + float2(1.0, 1.0));
+	return lerp(lerp(a, b, u.x), lerp(c, d, u.x), u.y);
+}
+
+// ---------------------------------------------------------------------------
+// Coordinates
+// ---------------------------------------------------------------------------
+
+float2 HolofyTransformUV(float2 UV, FHolofyParams P)
+{
+	float2 uv = UV;
+	if (P.FlipU > 0.5)
+	{
+		uv.x = 1.0 - uv.x;
+	}
+
+	const int Turns = ((int)round(P.UVRotation)) & 3;
+	float2 c = uv - 0.5;
+	if (Turns == 1)      { c = float2(c.y, -c.x); }
+	else if (Turns == 2) { c = -c; }
+	else if (Turns == 3) { c = float2(-c.y, c.x); }
+	return c + 0.5;
+}
+
+// 1D "vertical" coordinate that scanlines, bands, glitch slices and the materialize
+// reveal all run along. Local space is in meters so densities are "per meter".
+float HolofyScanCoord(FHolofyParams P, float3 LocalPos, float2 UV, float2 ScreenUV)
+{
+	if (P.CoordinateSpace < 0.5) { return LocalPos.z * 0.01; }
+	if (P.CoordinateSpace < 1.5) { return 1.0 - UV.y; }
+	return 1.0 - ScreenUV.y;
+}
+
+// 2D coordinate used for grids and dissolve noise.
+float2 HolofySurfaceCoord(FHolofyParams P, float3 LocalPos, float2 UV, float2 ScreenUV)
+{
+	if (P.CoordinateSpace < 0.5) { return float2(LocalPos.x + LocalPos.y, LocalPos.z) * 0.01; }
+	if (P.CoordinateSpace < 1.5) { return float2(UV.x, 1.0 - UV.y); }
+	return float2(ScreenUV.x * 1.7778, 1.0 - ScreenUV.y);
+}
+
+// ---------------------------------------------------------------------------
+// Glitch: signed horizontal shift for the slice containing Coord, in [-1, 1].
+// Shared by the vertex (WPO) and pixel paths so geometry and content tear together.
+// ---------------------------------------------------------------------------
+
+float HolofyGlitchShift(FHolofyParams P, float Coord, float Time)
+{
+	const float Freq = max(P.GlitchFrequency, 0.001);
+	const float StepId = floor(Time * Freq);
+	const float Lost = 1.0 - saturate(P.SignalStrength);
+	const float Strength = saturate(P.GlitchIntensity + Lost * 0.5);
+
+	// Bursts happen on some time steps; stronger glitch = more frequent bursts.
+	const float Burst = step(1.0 - Strength * 0.6, HolofyHash11(StepId * 1.618 + 0.37));
+	const float Slice = floor(Coord * max(P.GlitchSlices, 1.0));
+	const float Active = step(0.55, HolofyHash11(Slice * 1.37 + StepId * 0.71));
+	const float Offset = HolofyHash11(Slice * 7.13 + StepId * 3.7) * 2.0 - 1.0;
+	return Offset * Active * Burst * Strength;
+}
+
+// ---------------------------------------------------------------------------
+// Vertex: local-space offset, transformed to world by the material graph.
+// ---------------------------------------------------------------------------
+
+float3 HolofyVertexOffset(FHolofyParams P, FHolofyContext C)
+{
+	const float2 UV = HolofyTransformUV(C.UV, P);
+	// Screen space isn't meaningful in the vertex shader; fall back to local.
+	const float Coord = (P.CoordinateSpace > 1.5) ? C.LocalPos.z * 0.01 : HolofyScanCoord(P, C.LocalPos, UV, float2(0.0, 0.0));
+	const float Shift = HolofyGlitchShift(P, Coord, C.Time);
+	return float3(Shift * P.GlitchVertexOffset, 0.0, 0.0);
+}
+
+// ---------------------------------------------------------------------------
+// Pixel: returns (Emissive.rgb, Alpha). BlendHint: 0 = Additive, 1 = Translucent, 2 = Masked.
+// ---------------------------------------------------------------------------
+
+float4 HolofySurface(FHolofyParams P, FHolofyContext C, Texture2D ContentTex, SamplerState ContentTexSampler, float BlendHint)
+{
+	const float T = C.Time;
+	const float Lost = 1.0 - saturate(P.SignalStrength);
+
+	// --- UVs: rotation / flip / CRT curvature ---
+	float2 UV = HolofyTransformUV(C.UV, P);
+	float Inside = 1.0;
+	if (P.Curvature > 0.0)
+	{
+		const float2 cc = UV - 0.5;
+		UV = UV + cc * dot(cc, cc) * P.Curvature;
+		const float2 InRange = step(0.0, UV) * step(UV, 1.0);
+		Inside = InRange.x * InRange.y;
+	}
+
+	const float Coord = HolofyScanCoord(P, C.LocalPos, UV, C.ScreenUV);
+	const float2 Surf = HolofySurfaceCoord(P, C.LocalPos, UV, C.ScreenUV);
+
+	// --- Glitch ---
+	const float Shift = HolofyGlitchShift(P, Coord, T);
+
+	// --- Base color / content (always sampled: avoids gradient ops in flow control) ---
+	float3 Color = P.HoloColor;
+	{
+		float2 CUV = UV;
+		CUV.x += Shift * 0.08;
+		CUV = (P.ContentPixelate > 0.0) ? (floor(CUV * P.ContentPixelate) + 0.5) / max(P.ContentPixelate, 1.0) : CUV;
+
+		const float CA = P.ChromaticAberration * 0.004 * (1.0 + abs(Shift) * 6.0 + Lost * 2.0);
+		float3 Content;
+		Content.r = Texture2DSample(ContentTex, ContentTexSampler, CUV + float2(CA, 0.0)).r;
+		Content.g = Texture2DSample(ContentTex, ContentTexSampler, CUV).g;
+		Content.b = Texture2DSample(ContentTex, ContentTexSampler, CUV - float2(CA, 0.0)).b;
+
+		const float Lum = dot(Content, float3(0.2126, 0.7152, 0.0722));
+		Content = lerp(Content, Lum * P.HoloColor * 1.5, saturate(P.ContentTintAmount));
+		Color = lerp(Color, Content, saturate(P.ContentIntensity));
+	}
+
+	// --- Rim / fresnel (abs() so two-sided back faces glow too) ---
+	const float NdotV = saturate(abs(dot(normalize(C.Normal), normalize(C.CameraVector))));
+	const float Rim = pow(1.0 - NdotV, max(P.RimPower, 0.01));
+	Color += P.RimColor * Rim * P.RimIntensity;
+
+	// --- Scanlines (fade out when they'd alias at distance) ---
+	const float ScanPhase = (Coord - T * P.ScanlineSpeed) * P.ScanlineDensity;
+	const float Scan = pow(0.5 + 0.5 * sin(ScanPhase * HOLOFY_TAU), max(P.ScanlineSharpness, 0.01));
+	const float ScanFade = saturate(1.0 - (fwidth(ScanPhase) - 0.25) * 2.0);
+	const float ScanMul = lerp(1.0, Scan, saturate(P.ScanlineIntensity) * ScanFade);
+
+	// --- Sweep band: bright leading edge with a trailing glow ---
+	const float BandPhase = frac(Coord - T * P.BandSpeed);
+	const float Band = pow(BandPhase, 1.0 / max(P.BandWidth, 0.001)) * P.BandIntensity;
+	Color += P.HoloColor * Band;
+
+	// --- Grid ---
+	const float2 GridP = Surf * P.GridDensity;
+	const float2 GridD = abs(frac(GridP + 0.5) - 0.5);
+	const float2 GridAA = fwidth(GridP) + 1e-5;
+	const float2 GridL = 1.0 - smoothstep(P.GridThickness * 0.5, P.GridThickness * 0.5 + GridAA, GridD);
+	const float Grid = max(GridL.x, GridL.y) * P.GridIntensity;
+	Color += P.HoloColor * Grid * 2.0;
+
+	// --- CRT: RGB triad pixel grid + vignette ---
+	{
+		const float2 PG = UV * P.PixelGridDensity;
+		const float Sub = frac(PG.x) * 3.0;
+		const float3 SubMask = saturate(1.0 - abs(Sub - float3(0.5, 1.5, 2.5)) * 1.2);
+		const float Row = frac(PG.y);
+		const float RowMask = smoothstep(0.0, 0.25, Row) * (1.0 - smoothstep(0.75, 1.0, Row));
+		const float PGFade = saturate(1.0 - (max(fwidth(PG.x), fwidth(PG.y)) - 0.25) * 2.0);
+		Color *= lerp(float3(1.0, 1.0, 1.0), SubMask * RowMask * 2.5, saturate(P.PixelGridIntensity) * PGFade);
+
+		const float2 VV = UV * (1.0 - UV);
+		const float Vig = pow(saturate(VV.x * VV.y * 16.0), 0.4);
+		Color *= lerp(1.0, Vig, saturate(P.Vignette));
+	}
+
+	// --- Signal: flicker, dropouts, static snow, rolling bar ---
+	float Flicker = 1.0 - saturate(P.FlickerIntensity) * HolofyNoise1D(T * P.FlickerSpeed);
+	Flicker *= lerp(1.0, step(0.25, HolofyHash11(floor(T * 15.0))), Lost * Lost);
+
+	const float2 StaticUV = (P.CoordinateSpace > 0.5 && P.CoordinateSpace < 1.5) ? UV : C.ScreenUV * float2(1.7778, 1.0);
+	const float Static = HolofyHash21(floor(StaticUV * P.NoiseScale) + frac(T * 7.13) * 413.0);
+	const float StaticAmt = saturate(P.NoiseIntensity + Lost * 0.6);
+	Color = lerp(Color, Static * lerp(float3(1.0, 1.0, 1.0), P.HoloColor, 0.5) * 1.5, StaticAmt);
+
+	const float RollPhase = frac(Coord * 0.5 + T * 0.25);
+	const float RollBar = smoothstep(0.0, 0.05, RollPhase) * (1.0 - smoothstep(0.05, 0.15, RollPhase));
+	const float RollMul = 1.0 - RollBar * Lost * 0.7;
+
+	// --- Materialize: per-scanline staggered reveal with a glowing edge ---
+	const float EdgeW = max(P.MaterializeEdgeWidth, 0.0001);
+	const float LineId = floor(Coord * max(P.ScanlineDensity, 1.0));
+	const float Threshold = HolofyHash11(LineId * 0.37 + 11.0) * 0.6 + HolofyNoise2D(Surf * 6.0) * 0.4;
+	const float M = P.Materialize * (1.0 + 2.0 * EdgeW) - EdgeW;
+	const float Visible = step(Threshold, M);
+	const float Edge = Visible * (1.0 - smoothstep(0.0, EdgeW, M - Threshold));
+	Color += P.RimColor * Edge * P.MaterializeEdgeBrightness;
+
+	// --- Vertex color (particles / painted meshes) ---
+	const float VCAmt = saturate(P.VertexColorAmount);
+	const float3 VC = lerp(float3(1.0, 1.0, 1.0), C.VertexColor.rgb, VCAmt);
+	const float VA = lerp(1.0, C.VertexColor.a, VCAmt);
+
+	// --- Compose ---
+	Color *= Flicker * RollMul * Inside * VC * max(P.Brightness, 0.0);
+
+	float Alpha = saturate(P.Opacity) * ScanMul;
+	Alpha = saturate(Alpha + Rim * P.RimIntensity * 0.25 + Band * 0.25 + Grid * 0.5 + Static * StaticAmt * 0.5 + Edge);
+	Alpha *= Flicker * RollMul * Visible * Inside * VA;
+
+	if (BlendHint < 0.5)
+	{
+		// Additive: premultiply so Opacity still reads as "strength".
+		return float4(Color * Alpha, 1.0);
+	}
+	if (BlendHint < 1.5)
+	{
+		return float4(Color, Alpha);
+	}
+	// Masked: no partial alpha, so bake scanlines into the color and mask out hidden bits.
+	return float4(Color * ScanMul, Visible * Inside);
+}
